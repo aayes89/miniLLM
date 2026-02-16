@@ -197,6 +197,9 @@ def train(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.bfloat16
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     torch.manual_seed(42)
     if torch.cuda.is_available():
@@ -233,8 +236,21 @@ def train(args):
 
     tokens = tokens.contiguous()
 
+    # -- SUBMUESTREO POR EPOCH (ganar velocidad) ---
+    max_tokens = 1_000_000  # ajustar
+
+    if len(tokens) > max_tokens:
+        start = torch.randint(0, len(tokens) - max_tokens, (1,)).item()
+        tokens_epoch = tokens[start:start + max_tokens]
+    else:
+        tokens_epoch = tokens
+
     # ---------- MODEL ----------
     model = LlamaForCausalLM(Config).to(device)
+
+    # Compile (PyTorch 2.x Triton backend) si CUDA >=7.0
+    #if hasattr(torch, "compile"):
+    #    model = torch.compile(model)
 
     opt = torch.optim.AdamW(
         model.parameters(),
@@ -246,7 +262,7 @@ def train(args):
     start_epoch = 0
 
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=True)
         model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
         if scaler and ckpt.get("scaler") is not None:
@@ -255,21 +271,23 @@ def train(args):
 
     # ---------- DATASET ----------
     ds = TokenDataset(
-        tokens,
+        tokens_epoch,
         Config.max_position_embeddings,
         args.stride,
         assistant_id
     )
 
-    num_workers = min(4, os.cpu_count())
+    # DataLoader agresivo
+    num_workers = min(12, os.cpu_count())
 
     dl = torch.utils.data.DataLoader(
         ds,
         batch_size=args.batch,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=(device == "cuda"),
+        pin_memory=True,
         persistent_workers=(num_workers > 0),
+        prefetch_factor=8,
         drop_last=True
     )
 
@@ -280,13 +298,14 @@ def train(args):
         opt.zero_grad(set_to_none=True)
 
         for step, (x, y) in enumerate(tqdm(dl, desc=f"Epoch {epoch+1}/{args.epochs}")):
-            x = x.to(device)
-            y = y.to(device)
 
-            ctx = torch.autocast("cuda", dtype=dtype) if device == "cuda" else torch.autocast("cpu", dtype=dtype)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
-            with ctx:
+            with torch.autocast(device_type=device, dtype=dtype):
+
                 logits = model(x)
+
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     y.view(-1),
@@ -417,8 +436,8 @@ if __name__ == "__main__":
     ap.add_argument("--sp_model", required=True)
     ap.add_argument("--tokens", default="tokens.pt")
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--batch", type=int, default=4) # 8 o 96
-    ap.add_argument("--accum_steps", type=int, default=8) # 4 o 8
+    ap.add_argument("--batch", type=int, default=24) # 8 o 96
+    ap.add_argument("--accum_steps", type=int, default=2) # 4 o 8
     ap.add_argument("--stride", type=int, default=256) # 128 o 896
     ap.add_argument("--resume", help="checkpoint .pt para continuar entrenamiento")
     ap.add_argument("--out", default="ckpt")
