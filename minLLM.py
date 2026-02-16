@@ -18,7 +18,7 @@ from safetensors.torch import save_file, load_file
 # ============================================================
 
 class Config:
-    vocab_size = 8192
+    vocab_size = 1401, #8192
     hidden_size = 512
     intermediate_size = 2048
     num_hidden_layers = 6
@@ -193,7 +193,6 @@ class TokenDataset(torch.utils.data.Dataset):
 # ============================================================
 # TRAIN
 # ============================================================
-
 def train(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -203,14 +202,38 @@ def train(args):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
 
+    # ---------- TOKENIZER ----------
     sp = spm.SentencePieceProcessor(model_file=args.sp_model)
 
     assistant_id = sp.piece_to_id("<|assistant|>")
     if assistant_id == -1:
         raise ValueError("Tokenizer no contiene <|assistant|>")
 
-    tokens = torch.load(args.tokens, map_location="cpu")
+    # ---------- PRETOKEN ----------
+    token_path = Path(args.tokens)
 
+    if not token_path.exists():
+        print("[*] Pretokenizando corpus (una sola vez)...")
+        tokens = []
+
+        with open(args.corpus, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                ids = sp.encode(line)
+                tokens.extend(ids)
+                tokens.append(sp.eos_id())
+
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        torch.save(tokens, token_path)
+        print(f"[OK] tokens guardados en {token_path}")
+    else:
+        tokens = torch.load(token_path, map_location="cpu", weights_only=True)
+
+    tokens = tokens.contiguous()
+
+    # ---------- MODEL ----------
     model = LlamaForCausalLM(Config).to(device)
 
     opt = torch.optim.AdamW(
@@ -226,12 +249,11 @@ def train(args):
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
-
         if scaler and ckpt.get("scaler") is not None:
             scaler.load_state_dict(ckpt["scaler"])
-
         start_epoch = ckpt["epoch"] + 1
 
+    # ---------- DATASET ----------
     ds = TokenDataset(
         tokens,
         Config.max_position_embeddings,
@@ -251,19 +273,17 @@ def train(args):
         drop_last=True
     )
 
+    # ---------- TRAIN LOOP ----------
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0.0
         opt.zero_grad(set_to_none=True)
 
-        for step, (x, y) in enumerate(tqdm(dl)):
+        for step, (x, y) in enumerate(tqdm(dl, desc=f"Epoch {epoch+1}/{args.epochs}")):
             x = x.to(device)
             y = y.to(device)
 
-            if device == "cuda":
-                ctx = torch.autocast("cuda", dtype=dtype)
-            else:
-                ctx = torch.autocast("cpu", dtype=dtype)
+            ctx = torch.autocast("cuda", dtype=dtype) if device == "cuda" else torch.autocast("cpu", dtype=dtype)
 
             with ctx:
                 logits = model(x)
@@ -295,12 +315,16 @@ def train(args):
         print(f"Epoch {epoch+1} | Loss: {total_loss/len(dl):.4f}")
 
         os.makedirs(args.out, exist_ok=True)
-        torch.save({
-            "model": model.state_dict(),
-            "opt": opt.state_dict(),
-            "scaler": scaler.state_dict() if scaler else None,
-            "epoch": epoch
-        }, os.path.join(args.out, "checkpoint.pt"))
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "opt": opt.state_dict(),
+                "scaler": scaler.state_dict() if scaler else None,
+                "epoch": epoch
+            },
+            Path(args.out) / "checkpoint.pt"
+        )
+
 
 # ============================================================
 # SAVE HF
