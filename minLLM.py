@@ -18,7 +18,7 @@ from safetensors.torch import save_file, load_file
 # ============================================================
 
 class Config:
-    vocab_size = 1401, #8192
+    vocab_size = 1401 #8192
     hidden_size = 512
     intermediate_size = 2048
     num_hidden_layers = 6
