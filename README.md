@@ -30,6 +30,9 @@ Este script permite entrenar LLM desde cero funcional (~25–30M parámetros)
 * **--resume** ruta del checkpoint **.pt** para continuar entrenamiento
 * **--out** directorio donde almacena cada checkpoint, fijado a **ckpt**
 * **--lr** tasa de aprendizaje, valor tipo float, fijado a 1.5e-4, cambiar a 3e-4 o según necesidades
+# ---- modo inference ----
+* **--checkpoint** carga el checkpoint desde donde se pretende examinar los resultados del modelo
+* **--prompt** para indicar que se va a generar una salida, el formato es **"Érase una vez,"**
 
 ---
 # Posibles usos
