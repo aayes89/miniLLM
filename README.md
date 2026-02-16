@@ -36,3 +36,6 @@ Resumen:  Es un laboratorio.
 * Permite correr en GPU pequeña
 * Integración en sistemas edge
 ---
+# Ayuda
+
+Se necesita de un generador de texto sintético más eficiente para el entrenamiento de los modelos, cualquier sugerencia en función de mejora y progreso es bienvenida.
