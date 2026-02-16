@@ -197,6 +197,7 @@ def train(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.bfloat16
+
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -236,21 +237,8 @@ def train(args):
 
     tokens = tokens.contiguous()
 
-    # -- SUBMUESTREO POR EPOCH (ganar velocidad) ---
-    max_tokens = 1_000_000  # ajustar
-
-    if len(tokens) > max_tokens:
-        start = torch.randint(0, len(tokens) - max_tokens, (1,)).item()
-        tokens_epoch = tokens[start:start + max_tokens]
-    else:
-        tokens_epoch = tokens
-
     # ---------- MODEL ----------
     model = LlamaForCausalLM(Config).to(device)
-
-    # Compile (PyTorch 2.x Triton backend) si CUDA >=7.0
-    #if hasattr(torch, "compile"):
-    #    model = torch.compile(model)
 
     opt = torch.optim.AdamW(
         model.parameters(),
@@ -269,30 +257,38 @@ def train(args):
             scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
 
-    # ---------- DATASET ----------
-    ds = TokenDataset(
-        tokens_epoch,
-        Config.max_position_embeddings,
-        args.stride,
-        assistant_id
-    )
-
-    # DataLoader agresivo
-    num_workers = min(12, os.cpu_count())
-
-    dl = torch.utils.data.DataLoader(
-        ds,
-        batch_size=args.batch,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=8,
-        drop_last=True
-    )
+    max_tokens = 12_000_000
 
     # ---------- TRAIN LOOP ----------
     for epoch in range(start_epoch, args.epochs):
+
+        # --- SUBMUESTREO POR EPOCH (CORRECTO) ---
+        if len(tokens) > max_tokens:
+            start = torch.randint(0, len(tokens) - max_tokens, (1,)).item()
+            tokens_epoch = tokens[start:start + max_tokens]
+        else:
+            tokens_epoch = tokens
+
+        ds = TokenDataset(
+            tokens_epoch,
+            Config.max_position_embeddings,
+            args.stride,
+            assistant_id
+        )
+
+        num_workers = min(12, os.cpu_count())
+
+        dl = torch.utils.data.DataLoader(
+            ds,
+            batch_size=args.batch,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=8,
+            drop_last=True
+        )
+
         model.train()
         total_loss = 0.0
         opt.zero_grad(set_to_none=True)
@@ -303,9 +299,7 @@ def train(args):
             y = y.to(device, non_blocking=True)
 
             with torch.autocast(device_type=device, dtype=dtype):
-
                 logits = model(x)
-
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     y.view(-1),
@@ -317,6 +311,7 @@ def train(args):
             else:
                 loss.backward()
 
+            # ---- CORRECTO: step SOLO cuando toca ----
             if (step + 1) % args.accum_steps == 0:
                 if scaler:
                     scaler.unscale_(opt)
@@ -331,6 +326,19 @@ def train(args):
 
             total_loss += loss.item() * args.accum_steps
 
+        # ---- FLUSH FINAL SI QUEDÓ RESTO ----
+        if (step + 1) % args.accum_steps != 0:
+            if scaler:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+            opt.zero_grad(set_to_none=True)
+
         print(f"Epoch {epoch+1} | Loss: {total_loss/len(dl):.4f}")
 
         os.makedirs(args.out, exist_ok=True)
@@ -339,9 +347,16 @@ def train(args):
                 "model": model.state_dict(),
                 "opt": opt.state_dict(),
                 "scaler": scaler.state_dict() if scaler else None,
-                "epoch": epoch
+                "epoch": epoch,
+                "rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             },
-            Path(args.out) / "checkpoint.pt"
+            Path(args.out) / f"checkpoint{epoch+1}.pt"
+        )
+
+        torch.save(
+            model.state_dict(),
+            Path(args.out) / f"model_epoch{epoch+1}.pt"
         )
 
 
